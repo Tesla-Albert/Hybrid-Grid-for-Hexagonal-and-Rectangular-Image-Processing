@@ -1,0 +1,9 @@
+# Editable install with no version control (hygird==1.0.0)
+scipy
+numpy
+torch
+numba
+opencv-python
+gdal
+pyopengl
+glfw
