@@ -1,0 +1,739 @@
+class Hex_to_Square_Conv2d_by_Double_Stride(nn.Module):
+    def __init__(self, channels, even_odd_offset, downsample_factor=2,
+                 padding=0, padding_mode='constant', padding_value=0):
+        super(Hex_to_Square_Conv2d_by_Double_Stride, self).__init__()
+        """
+        :param channels: 输入特征图的通道数
+        :param even_odd_offset: 首行奇偶性
+        :param downsample_factor: 六边形卷积核半径
+        :param stride: 卷积核移动步长,默认为1，卷积时要将步长×2
+        :param padding: 填充
+        :param padding_mode: 填充行列数
+        :param padding_value: 填充值
+        """
+        self.in_channels = channels
+        self.out_channels = channels
+        if downsample_factor%2!=0:
+            raise Exception("降采样因子必须是2的倍数")
+        self.even_odd_offset = even_odd_offset
+        self.padded_even_odd_offset = (even_odd_offset + padding)%2
+        # self.odd_kernelline_offset = (self.padded_even_odd_offset+hexkernel_radius-1+stride)%2
+        # self.out_even_odd_offset = (even_odd_offset - padding + hexkernel_radius-1)%2
+        self.kernel_size = downsample_factor
+        self.kernelnum = downsample_factor**2
+        self.out_even_odd_offset = 0
+        self.pad = padding
+        self.padding_mode = padding_mode
+        self.padding_value = padding_value
+        self.kernel = nn.Parameter(self.generate_weight(downsample_factor))
+        # self.kernel = nn.Parameter(
+        #     torch.full([out_channels, in_channels, 1, self.kernelnum], fill_value = 1 / (self.kernelnum*in_channels), dtype=torch.float))
+        self.k_h = self.kernel_size
+        self.k_w = 3 * downsample_factor - 2
+        self.stride = (downsample_factor, 2*downsample_factor-1)
+        self.downsample_factor = downsample_factor
+    def generate_weight(self, f):
+        """
+        按照双线性插值的方式给定初值
+        :param f: 降采样因子
+        :return:
+        """
+        x = torch.arange(0, f).float()
+        y = torch.arange(0, f).float()
+        coor = torch.cartesian_prod(x, y).view(f, f, 2)
+        dist = 1 / torch.sqrt((coor[:, :, 0] - (f - 1) / 2) * (coor[:, :, 0] - (f - 1) / 2) + \
+                              (0.5 * coor[:, :, 0] + coor[:, :, 1] - 3 * (f - 1) / 4) * (
+                                          0.5 * coor[:, :, 0] + coor[:, :, 1] - 3 * (f - 1) / 4))
+        weight = (dist / dist.sum()).unsqueeze(0).repeat(self.out_channels,1,1)
+        return weight
+    def forward(self, input):
+        self.weight = torch.zeros([self.in_channels, 1, self.k_h, self.k_w], device=input.device, dtype=torch.float)
+        sum = 0
+        for i in range(self.k_h):
+            self.weight[:, 0, i, i:i + (self.k_h - 1) * 2 + 1:2] += self.kernel[:, i, :]
+        while input.dim() < 4:
+            input = input.unsqueeze(0)
+        input = pad(input, self.pad, self.padding_mode, self.padding_value)
+        offset = self.padded_even_odd_offset
+        type1image = heximage_to_type1(input, offset)
+        evenconv = F.conv2d(input=type1image[:, :, :, 1:None if(self.padded_even_odd_offset%2 == 0) else -1],
+                            weight=self.weight[:],
+                            stride=self.stride,
+                            groups=self.weight.size(0))
+
+        return evenconv
+    def __repr__(self):
+        return f"Hex_to_Square_Conv2d_by_Double_Stride({self.in_channels}, downsample_factor=stride*2={self.downsample_factor}, padding={self.pad})"
+
+class HexPixelShuffle(nn.Module):
+    def __init__(self, upscale_factor):
+        super(HexPixelShuffle, self).__init__()
+        self.upscale_factor = upscale_factor
+    def forward(self, input):
+        while input.dim()<4:
+            input = input.unsqueeze(0)
+        batch = input.size(0)
+        in_channel = input.size(1)
+        in_height = input.size(2)
+        odd_height = in_height//2
+        even_height = in_height - odd_height
+        in_width = input.size(3)
+        if in_channel%(self.upscale_factor**2)!=0:
+            raise Exception("在 pixel shuffle 这个函数中，输入图像的通道数必须是 上采样倍率 平方 的整数倍，而现在输入的图像通道数并不满足这个条件")
+
+        out_channel = in_channel//(self.upscale_factor**2)
+        out_height = self.upscale_factor * in_height + self.upscale_factor - 1
+        out_width = self.upscale_factor * in_width + self.upscale_factor//2
+        out = torch.zeros([batch, out_channel, out_height, out_width*2+1],device=input.device)
+        tmp = torch.zeros([batch, out_channel, in_height, in_width, 0], device=input.device)
+
+        if self.upscale_factor%2 == 0:
+            type1_off = 1
+        else:
+            type1_off = -1
+
+        for ci in range(self.upscale_factor**2):
+            tmp = torch.cat(
+                (tmp, torch.unsqueeze(input[:,ci*out_channel:(ci+1)*out_channel,:,:], 4)),
+                4
+            )
+
+        n=0
+        for i in range(2*self.upscale_factor - 1):
+            t = np.abs(1+i-self.upscale_factor)
+            for k in range(self.upscale_factor - t):
+                out[:,:,
+                i : i + 2*(self.upscale_factor)*(even_height-1)+1 : 2*self.upscale_factor,
+                1+t+2*k : (1+t+2*k)+(in_width-1)*2*self.upscale_factor+1 : 2*self.upscale_factor]\
+                =\
+                out[:, :,
+                i: i + 2 * (self.upscale_factor) * (even_height - 1) + 1: 2 * self.upscale_factor,
+                1 + t + 2 * k+type1_off : (1 + t + 2 * k+type1_off) + (in_width - 1) * 2 * self.upscale_factor + 1: 2 * self.upscale_factor] \
+                =tmp[:, :, ::2, :, n]
+
+                out[:, :,
+                self.upscale_factor+i: self.upscale_factor+i + 2 * (self.upscale_factor) * (odd_height - 1) + 1: 2 * self.upscale_factor,
+                self.upscale_factor+1 + t + 2 * k: self.upscale_factor+(1 + t + 2 * k) + (in_width - 1) * 2 * self.upscale_factor + 1: 2 * self.upscale_factor] \
+                = \
+                out[:, :,
+                self.upscale_factor+i: self.upscale_factor+i + 2 * (self.upscale_factor) * (odd_height - 1) + 1: 2 * self.upscale_factor,
+                self.upscale_factor+(1 + t + 2 * k + type1_off): self.upscale_factor+(1 + t + 2 * k + type1_off) + (
+                            in_width - 1) * 2 * self.upscale_factor + 1: 2 * self.upscale_factor] \
+                = tmp[:, :, 1::2, :, n]
+                n+=1
+
+        out, offset = type1_to_heximage(out, 0)
+        return out[:,:,self.upscale_factor-1: -self.upscale_factor+1, self.upscale_factor//2: -self.upscale_factor//2]
+
+
+class HexConvTranspose2d(nn.Module):
+    def __init__(self, in_channels, out_channels, even_odd_offset, hexkernel_radius, stride=1,
+                 groups=1, bias=False):
+        super().__init__()
+        """
+        双倍优化坐标卷积方案
+        :param in_channels: 输入通道数
+        :param out_channels: 输出通道数
+        :param even_odd_offset: 首行奇偶性
+        :param hexkernel_radius: 六边形卷积核半径
+        :param stride: 卷积核移动步长
+        :param padding: 填充
+        :param groups: 分组的组数
+        :param bias: 是否偏置
+        :param padding_mode: 填充行列数
+        """
+        self.in_channel = in_channels
+        self.out_channel = out_channels
+
+        self.even_odd_offset = even_odd_offset
+
+        self.hexkernel_radius = hexkernel_radius
+        self.hexkernel_size = 2 * hexkernel_radius - 1
+        self.k_w = 4 * hexkernel_radius - 3
+        self.k_h = self.hexkernel_size
+        self.kernelnum = 3 * hexkernel_radius ** 2 - 3 * hexkernel_radius + 1
+        self.sh = stride
+        self.sw = stride * 2
+        self.out_even_odd_offset = 0
+        self.groups = groups
+        self.b = bias
+
+
+
+
+        if in_channels % groups != 0:
+            raise ValueError('in_channels must be divisible by groups')
+        if out_channels % groups != 0:
+            raise ValueError('out_channels must be divisible by groups')
+
+        self.kernel = nn.Parameter(
+            torch.empty([out_channels, in_channels // groups, 1, self.kernelnum], dtype=torch.float))
+        # self.kernel = nn.Parameter(
+        #     torch.full([out_channels, in_channels, 1, self.kernelnum], fill_value = 1 / (self.kernelnum*in_channels), dtype=torch.float))
+        if self.b == True:
+            self.bias = nn.Parameter(torch.empty([out_channels, ]))
+        else:
+            self.register_parameter('bias', None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        init.kaiming_uniform_(self.kernel, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = init._calculate_fan_in_and_fan_out(self.kernel)
+            if fan_in != 0:
+                bound = 1 / math.sqrt(fan_in)
+                init.uniform_(self.bias, -bound, bound)
+    def input_interpolation(self, input, k_r, s)->torch.Tensor:
+        b = input.size(0)
+        c = input.size(1)
+        h = input.size(2)
+        w = input.size(3)
+        w1 = 2 * s * w - s + 2 + (1 - s%2)
+        h1 = s * h - s + 1
+        out = torch.zeros(b, c, h1, w1)
+        out[:, :, 0::2*s, self.even_odd_offset*s:-1:2*s]=\
+            input[:, :, 0::2, :]
+        out[:, :, 0::2*s, self.even_odd_offset*s+1: :2*s]=\
+            input[:, :, 0::2, :]
+
+        out[:, :, s::2*s, (1-self.even_odd_offset)*s:-1:2*s]=\
+            input[:, :, 1::2, :]
+        out[:, :, s::2*s, (1-self.even_odd_offset)*s+1: :2*s]=\
+            input[:, :, 1::2, :]
+        p = k_r-1
+        out = F.pad(out, (2*p, 2*p, p, p), 'constant', 0)
+        return out
+    def forward(self, input: Tensor) -> Tensor:
+        """
+        卷积
+        :param input: 输入为标准的六边形灰度矩阵
+                首先对周围一圈进行行列填充
+                然后根据输入图像首行奇偶性和填充行数确定填充后图像的首行奇偶性
+                接着按照首行奇偶性生成第一类图像，即双倍优化坐标的图像
+                在宽度为[第二个像素~倒数第二个像素]的范围内进行卷积
+        :return: 标准的六边形灰度矩阵
+        """
+        self.weight = torch.zeros([self.out_channel, self.in_channel // self.groups, self.k_h, self.k_w],
+                                  device=input.device, dtype=torch.float)
+
+        sum = 0
+        for i in range(self.hexkernel_size):
+            t = int(np.abs(i - self.hexkernel_radius + 1))
+            ln = self.hexkernel_size - t
+            self.weight[:, :, i, t:t + (ln - 1) * 2 + 1:2] += self.kernel[:, :, 0, sum:ln + sum]
+            sum += ln
+        while input.dim() < 4:
+            input = input.unsqueeze(0)
+        input = self.input_interpolation(input, self.hexkernel_radius, self.sh)
+        # offset = self.padded_even_odd_offset
+        # odd_kernelline_offset = self.odd_kernelline_offset
+        type1image = input
+
+        evenconv = F.conv2d(input=type1image[:, :, :, 1:-self.sh],
+                            weight=self.weight,
+                            bias=self.bias,
+                            stride=(2, 2),
+                            groups=self.groups,
+                            )
+        oddconv = F.conv2d(input=type1image[:, :, self.sh:, self.sh + 1:],
+                           weight=self.weight,
+                           bias=self.bias,
+                           stride=(2, 2),
+                           groups=self.groups,
+                           )
+        pad_width = evenconv.size(3) - oddconv.size(3)
+        # print(pad_width)
+
+        # 这是为了将奇数行和偶数行的像元数目补成一样的，不是为了交错，所以就应该在一边补
+        if pad_width > 0:
+            # oddconv = torch.cat(
+            # (oddconv,
+            #  oddconv[:,:,:,-1:].repeat_interleave(np.abs(pad_width),dim=3)),
+            # 3)
+            evenconv = evenconv[:, :, :, :-pad_width]
+            # oddconv = torch.cat(
+            #     (oddconv,
+            #      torch.ones([oddconv.size(0),oddconv.size(1),oddconv.size(2),1])),
+            #     3)
+        elif pad_width < 0:
+            # evenconv = torch.cat(
+            #     (evenconv,
+            #      evenconv[:,:,:,-1:].repeat_interleave(np.abs(pad_width),dim=3)),
+            #     3)
+            oddconv = oddconv[:, :, :, :pad_width]
+
+        convedimage = torch.empty([oddconv.shape[0],
+                                   oddconv.shape[1],
+                                   oddconv.shape[2] + evenconv.shape[2],
+                                   evenconv.shape[3]], device=input.device)
+        convedimage[:, :, ::2, :] = evenconv
+        convedimage[:, :, 1::2, :] = oddconv
+        return convedimage
+
+    def __repr__(self):
+        return f"HexConv2d({self.in_channel}, {self.out_channel}, kernel_radius={self.hexkernel_radius}, stride={self.sh}, padding={self.pad}, bias={self.b})"
+
+
+class im2col_HexConv2d(nn.Module):
+    def __init__(self, in_channels,out_channels, even_odd_offset, hexkernel_radius, stride = 1,
+                 padding = 0, dialation = 1, groups  = 1,
+                 bias = True, padding_mode = 'constant', padding_value = 0):
+        """
+        六边形像素图像索引卷积类
+        :param in_channels: 输入图像的通道数量
+        :param out_channels: 输出图像的通道数量
+        :param even_odd_offset: 输入图像第一行是原地不动的那种还是右移半格的那种。
+        :param hexkernel_radius: 六边形卷积核半径
+        :param stride: 卷积核移动的步长
+        :param padding: 填充，即图像边缘新增加的行数和列数
+        :param dialation: 空洞卷积的空洞到底有多大（卷积核内两个有值的像素之间的距离），待实现，以后用到了再说
+        :param groups: 将输入频道分成的组数
+        :param bias: 偏置量，每个通道加上相同的偏置量，所以它是一个channel * 1的列向量
+        :param padding_mode: 填充模式（只实现了零填充，后面需要其它填充再说）
+        """
+        super(im2col_HexConv2d,self).__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.even_odd_offset = even_odd_offset
+        self.out_even_odd_offset = (even_odd_offset - padding + hexkernel_radius - 1)%2
+        self.hexkernel_radius = hexkernel_radius
+        self.stride = stride
+        self.padding = padding
+        self.dialation = dialation
+        self.groups = groups
+        self.bias = bias
+        self.padding_mode = padding_mode
+        self.padding_value = padding_value
+
+        self.kernelnum = 3 * hexkernel_radius**2 - 3 * hexkernel_radius + 1
+        self.kernelsize = 2 * hexkernel_radius - 1
+
+        # self.weight = nn.Parameter(torch.randn([in_channels*self.kernelnum, out_channels]))
+        self.weight = torch.randn([in_channels*self.kernelnum, out_channels])
+        self.weight[:,:] = 1 / (self.kernelnum*in_channels)
+        if bias == True:
+            self.bias = nn.Parameter(torch.randn(out_channels))
+        else:
+            self.bias = None
+
+    def forward(self, input:torch.Tensor):
+        while input.dim()<4:
+            input = input.unsqueeze(0)
+
+        output = im2col_hex_conv2d(input,
+                   self.even_odd_offset,
+                   self.out_channels,
+                   self.hexkernel_radius,
+                   self.weight,
+                   self.stride,
+                   self.padding,
+                   self.dialation,
+                   self.groups,
+                   self.bias)
+
+        return output
+def im2col_hex_conv2d(input:torch.Tensor, even_odd_offset, out_channels, kernel_radius, weight:torch.Tensor, stride = 1,
+                 padding = 0, dilation = 1, groups  = 1, bias = None) ->torch.Tensor:
+    """
+    函数功能：对输入的图像（input）执行2维卷积和加偏置项bias
+    :param input: 输入的特征图像
+    :param even_odd_offset: 输入图像的首行奇偶性设定量
+    :param kernel_radius: 卷积核半径
+    :param weight: 卷积核的权重[kernelnum*in_channels, out_channels]
+    :param stride: 卷积核移动的步长
+    :param padding: 特征图像边缘的像素填充行的数量和列的数量
+    :param dialation: 空洞卷积的膨胀尺寸
+    :param groups: 将输入通道分成的组数
+    :param bias: 偏置
+    :return: 返回卷积后的图像
+
+    """
+    kernel = weight
+    batch_size, in_channels, input_h, input_w = input.shape
+    kernelsize = 2 * kernel_radius - 1
+    output_w = math.floor((input_w - kernelsize + 2*padding) / stride) + 1
+    output_h = math.floor((input_h - kernelsize + 2*padding) / stride) + 1
+    conved_matrix = hex_im2col(input, even_odd_offset, out_channels, kernel_radius, stride, padding) @ kernel
+    #   [batch, output_w * output_h, kernelnum * in_channels] @ [(kernelnum*in_channels) * out_channels]
+    # = [batch, output_w * output_h, out_channels]
+    if bias is not None:
+        conved_matrix = conved_matrix + bias
+    conved_matrix = conved_matrix.transpose(1, 2)
+    output = torch.reshape(conved_matrix,(batch_size, out_channels, output_h, output_w))
+    return output
+
+def hex_im2col(input:torch.Tensor, even_odd_offset, out_channels, kernel_radius, stride, padding) -> torch.Tensor:
+    """
+    函数功能：把输入图像按卷积核移动经过的路径索引表展开成矩阵，用于卷积运算
+    卷积核[kernelnum*in_channels, out_channels]
+    :param input: 输入矩阵[batch_size, in_channels, input_h, input_w]
+    :param even_odd_offset: 首行奇偶性设定量，0为偶，1为奇
+    :param out_channels: 输出通道
+    :param kernel_radius: 卷积核半径
+    :param padding: 需要填充的行的数目和列的数目
+    :return: flattened matrix:[batch, output_w * output_h, kernelnum * in_channels], out_channels 由卷积函数控制
+    """
+    input = pad(input, padding)
+
+    batch_size, in_channels, input_h, input_w = input.shape
+    kernelsize = 2 * kernel_radius - 1
+    out_channels = out_channels
+    kernelnum = 3 * kernel_radius**2 - 3 * kernel_radius + 1
+
+
+    output_w = math.floor((input_w - kernelsize) / stride) + 1
+    output_h = math.floor((input_h - kernelsize) / stride) + 1
+
+    output = torch.zeros([batch_size, out_channels, output_h, output_w])
+    # 卷积经过的区域内所有像素及其领域展平后的向量堆叠成矩阵，其宽度为卷积核宽度，高度为卷积核经过的所有像元数目
+    # 卷积核展成列向量
+
+    # 计数器，用于跟踪当前行的索引
+    output_matrix = torch.empty(0)
+    for b in range(batch_size):
+        # for o in range(out_channels):
+        # for i in range(in_channels):
+        region_matrix = torch.empty(0)
+        row_index = 0
+        for h in range(0, input_h - kernelsize + 1, stride):  # 对高度进行遍历（步长为stride）
+            for w in range(0, input_w - kernelsize + 1, stride):  # 对宽度进行遍历（步长为stride）
+                region_vector = torch.empty(0)#(h+r-1,w+r-1)处像元的卷积邻域
+                for l in range(0, kernelsize):
+                    t  = np.abs(l+1 - kernel_radius)# 相对于卷积核中间的那一行“0:”，往上或下写出行数: 1,2,3,...,r-1
+                    dl = np.abs(h + even_odd_offset + kernel_radius - 1 -padding)&1#卷积核的形状，这和奇偶行有关系
+                    ln = kernelsize-t#卷积核在进行当前卷积操作时，覆盖内的第l行的所有n个元素
+                    region = input[b, :, h+l, w + t//2 + dl*(t&1): w + t//2 + dl*(t&1) + ln]
+
+
+                    region_vector = torch.cat((region_vector, region), dim = 1)
+
+                region_matrix = torch.cat((region_matrix, torch.unsqueeze(region_vector.flatten(), 0)), dim = 0)
+                row_index += 1
+
+
+
+        output_matrix = torch.cat((output_matrix, torch.unsqueeze(region_matrix, 0)), dim=0)# 虽然我觉得这么写简直是有毛病，但是先这样吧，实现了功能再说，就是把数组拼起来，而且在一个新的维度append数组。
+        p = 1
+
+    return output_matrix
+
+class Square_to_Hex_Conv2d_by_Double_Stride(nn.Module):
+    def __init__(self, channels, downsample_factor,
+                 padding=0, padding_mode='constant', padding_value=0):
+        """
+        :param channels: 输入/输出通道数
+        :param downsample_factor: 降采样因子，同时也是卷积核尺寸
+        :param padding: 填充
+        :param padding_mode:填充模式
+        :param padding_value:填充值
+        """
+
+        super(Square_to_Hex_Conv2d_by_Double_Stride, self).__init__()
+        if downsample_factor%2!=0:
+            raise Exception("降采样因子必须是2的倍数")
+        self.in_channels = channels
+        self.out_channels = channels
+        self.kernel_size = downsample_factor
+        self.stride = (downsample_factor, downsample_factor)
+        self.out_even_odd_offset = 0
+        self.pad = padding
+        self.padding_mode = padding_mode
+        self.padding_value = padding_value
+        self.kernel = nn.Parameter(self.generate_weight(downsample_factor))
+        self.downsample_factor = downsample_factor
+    def generate_weight(self, f):
+        """
+        按照双线性插值的方式给定初值
+        :param f: 降采样因子
+        :return:
+        """
+        x = torch.arange(0, f).float()
+        y = torch.arange(0, f).float()
+        coor = torch.cartesian_prod(x, y).view(f, f, 2)
+        dist = 1 / torch.sqrt((coor[:, :, 0] - (f - 1) / 2) * (coor[:, :, 0] - (f - 1) / 2) + \
+                              (coor[:, :, 1] - (f - 1) / 2) * (coor[:, :, 1] - (f - 1) / 2))
+        weight = (dist / dist.sum()).unsqueeze(0).repeat(self.out_channels, 1, 1)
+        return weight.view(self.in_channels, f*f)
+
+    def forward(self, input):
+
+        while input.dim() < 4:
+            input = input.unsqueeze(0)
+        input = pad(input, self.pad, self.padding_mode, self.padding_value)
+        hex_h = input.size(2) // self.downsample_factor
+        hex_w = (input.size(3) - 1) // self.downsample_factor
+        a = self.stride[0]/2
+        evenrows = pixel_even_row_square_unfold(input[:,:,:,:(-self.stride[0]//2)], 2)
+        oddrows = pixel_even_row_square_unfold(input[:,:,self.stride[0]:, (self.stride[1]//2):], 2)
+        # evenconv = F.conv2d(input=input[:, :, :, 0:2*hex_w],
+        #                     weight=self.weight[:],
+        #                     stride=self.stride,
+        #                     )
+        evenconv = torch.empty(0, device=input.device)
+        oddconv = torch.empty(0, device=input.device)
+        for i in range(self.in_channels):
+            evenconv = torch.cat((evenconv, torch.matmul(evenrows[:, i, :, :, :], self.kernel[i, :]).unsqueeze(1)), dim=1)
+            oddconv = torch.cat((oddconv, torch.matmul(oddrows[:, i, :, :, :], self.kernel[i, :]).unsqueeze(1)), dim=1)
+        # oddconv = F.conv2d(input=input[:, :, self.downsample_factor/2:, self.stride:],
+        #                     weight=self.weight[:],
+        #                     stride=self.stride,
+        #                     )
+
+
+        convedimage = torch.empty([oddconv.shape[0],
+                                   oddconv.shape[1],
+                                   oddconv.shape[2] + evenconv.shape[2],
+                                   evenconv.shape[3]], device=input.device)
+        convedimage[:, :, ::2, :] = evenconv
+        convedimage[:, :, 1::2, :] = oddconv
+        return convedimage
+
+    def __repr__(self):
+        return f"Hex_to_Square_Conv2d_by_Double_Stride({self.in_channels}, {self.out_channels}, kernel_radius={self.kernel_size}, downsample_factor=stride*2={self.stride * 2}, padding={self.pad},bias={self.b})"
+class Quadtree_HexPooling(nn.Module):
+    def __init__(self, method,device = torch.device("cpu")):
+        super(Quadtree_HexPooling,self).__init__()
+        self.device = device
+        self.out_offset = 0
+        self.PoolingMethods = {'max':max_pooling,
+                               'min':min_pooling,
+                               'average':average_pooling}
+                               # 'centroid':centroid_pooling
+        self.method = self.PoolingMethods[method]
+    def forward(self, input, offset):
+        input = input.to(self.device)
+        while input.dim() < 4:
+            input = input.unsqueeze(0)
+
+        evenrows = pixel_even_row_quadtree_unfold(input[:, :, offset:, :-1])
+        oddrows = pixel_even_row_quadtree_unfold(input[:, :, offset + 2:, 1:])
+
+        pad_width = evenrows.shape[3] - oddrows.shape[3]
+        if pad_width > 0:
+            # evenrows = torch.cat(
+            #     (evenrows,
+            #      torch.zeros([evenrows.shape[0], evenrows.shape[1], evenrows.shape[2], np.abs(pad_width),4], device=self.device)),
+                    # 3)
+            evenrows = evenrows[:,:,:,:-pad_width]
+        elif pad_width < 0:
+            # oddrows = torch.cat(
+            #      (oddrows,
+            #             torch.zeros([oddrows.shape[0], oddrows.shape[1], oddrows.shape[2], np.abs(pad_width),4], device= self.device)),
+            #         3)
+            oddrows = oddrows[:,:,:,:-pad_width]
+        pooled_feature = torch.empty([evenrows.shape[0],
+                                  evenrows.shape[1],
+                                  evenrows.shape[2] + oddrows.shape[2],
+                                  evenrows.shape[3],
+                                      4], device= self.device)
+        pooled_feature[:,:,::2,:,:] = evenrows
+        pooled_feature[:,:,1::2,:,:] = oddrows
+        return self.method(pooled_feature)
+class Dimond_HexPooling(nn.Module):
+    def __init__(self, method, kernelsize=2, stride=None, padding = 0, even_odd_offset = 0, padding_mode = 'constant', padding_value = 0):
+        super(Dimond_HexPooling,self).__init__()
+        self.out_offset = 0
+        self.offset = (even_odd_offset + padding)%2
+        self.PoolingMethods = {'max':max_pooling,
+                               'min':min_pooling,
+                               'average':average_pooling,
+                               'centroid':centroid_pooling}
+        self.method = self.PoolingMethods[method]
+        self.kernelsize = kernelsize
+        self.stride = stride
+        if stride == None:
+            self.stride = kernelsize
+        self.padding = padding
+        self.padding_mode = padding_mode
+        self.padding_value = padding_value
+    def forward(self, input):
+        while input.dim() < 4:
+            input = input.unsqueeze(0)
+        input = pad(input,self.padding,self.padding_mode, self.padding_value)
+        # input = heximage_to_type1(input[:, :, offset:, :],0)
+        input = heximage_to_type1(input[:, :, :, :], self.offset)
+        evenrows = pixel_even_row_dimond_unfold_1(input[:,:,:,:],self.kernelsize,self.stride, self.offset)
+        oddrows = pixel_even_row_dimond_unfold_1(input[:,:,self.stride:,self.stride:],self.kernelsize,self.stride, self.offset)
+        pad_width = evenrows.shape[3] - oddrows.shape[3]
+        if pad_width > 0:
+            # oddrows = torch.cat(
+                # (oddrows,
+                #  torch.zeros(
+                #      [oddrows.shape[0], oddrows.shape[1], oddrows.shape[2], np.abs(pad_width), self.kernelsize ** 2],
+                #      device=input.device)),
+                # 3)
+            evenrows = evenrows[:, :, :, :-pad_width]
+        elif pad_width < 0:
+            # evenrows = torch.cat(
+            #     (evenrows,
+            #      torch.zeros(
+            #          [evenrows.shape[0], evenrows.shape[1], evenrows.shape[2], np.abs(pad_width), self.kernelsize ** 2],
+            #          device=input.device)),
+            #     3)
+            oddrows = oddrows[:,:,:,:pad_width]
+
+        pooled_feature = torch.empty([evenrows.shape[0],
+                                  evenrows.shape[1],
+                                  evenrows.shape[2] + oddrows.shape[2],
+                                  evenrows.shape[3],
+                                self.kernelsize ** 2], device= input.device)
+        pooled_feature[:,:,::2,:,:] = evenrows
+        pooled_feature[:,:,1::2,:,:] = oddrows
+        return self.method(pooled_feature)
+    def __repr__(self):
+        return f"Dimond_HexPooling({self.method.__name__}, kernelsize={self.kernelsize}, stride={self.stride}, padding={self.padding})"
+
+class Hex_to_Square_original_resolution(nn.Module):
+    def __init__(self, channels, even_odd_offset,
+                 padding=0, padding_mode='constant', padding_value=0, trainable = False):
+        super(Hex_to_Square_original_resolution, self).__init__()
+        """
+                :param channels: 输入特征图的通道数
+                :param even_odd_offset: 首行奇偶性
+                :param downsample_factor: 六边形卷积核半径
+                :param stride: 卷积核移动步长,默认为1，卷积时要将步长×2
+                :param padding: 填充
+                :param padding_mode: 填充行列数
+                :param padding_value: 填充值
+                """
+        self.in_channels = channels
+        self.out_channels = channels
+        self.even_odd_offset = even_odd_offset
+        self.offset = (even_odd_offset + padding) % 2
+        # self.odd_kernelline_offset = (self.padded_even_odd_offset+hexkernel_radius-1+stride)%2
+        # self.out_even_odd_offset = (even_odd_offset - padding + hexkernel_radius-1)%2
+        self.kernel_size = 2
+        self.kernelnum = 4
+        self.out_even_odd_offset = 0
+        self.padding = padding
+        self.padding_mode = padding_mode
+        self.padding_value = padding_value
+        self.kernel = nn.Parameter(self.generate_weight(2), requires_grad=trainable)
+        a=0
+    def generate_weight(self, f):
+        x = torch.arange(0, f).float()
+        y = torch.arange(0, f).float()
+        coor = torch.cartesian_prod(x, y).view(f, f, 2)
+        dist = 1 / torch.sqrt((coor[:, :, 0] + coor[:, :, 1] - (f - 1)) * (coor[:, :, 0] + coor[:, :, 1] - (f - 1)) + \
+                              (0.5 * coor[:, :, 0] - 0.5 * coor[:, :, 1]) * (0.5 * coor[:, :, 0] - 0.5 * coor[:, :, 1]))
+        weight = (dist / dist.sum()).unsqueeze(0).repeat(self.out_channels, 1, 1)
+        return weight.view(self.in_channels, f*f)
+    def forward(self, input):
+        while input.dim() < 4:
+            input = input.unsqueeze(0)
+        input = pad(input, self.padding, self.padding_mode, self.padding_value)
+        result = input
+        # input = heximage_to_type1(input[:, :, offset:, :],0)
+        input = heximage_to_type1(input[:, :, :, :], self.offset)
+        evenrows = pixel_even_row_dimond_unfold_1(input[:,:,:,:],self.kernel_size,1, 0)
+        tmp = torch.empty(0, device=input.device)
+        for i in range(self.in_channels):
+            tmp = torch.cat((tmp, torch.matmul(evenrows[:, i, :, :, :], self.kernel[i,:]).unsqueeze(1)), dim=1)
+
+        result[:,:,1:-1:2, 1:] = tmp
+        # print("transform implemented")
+        return result[:,:,:,1:]
+def pixel_even_row_quadtree_unfold(input)->torch.Tensor:
+    quadtree_leaf_0 = input[:, :, 1:-1:4, 0:-1:2]
+    quadtree_leaf_1 = input[:, :, 2:  :4, 0:-1:2]
+    quadtree_leaf_2 = input[:, :, 1:-1:4, 1:  :2]
+    quadtree_leaf_3 = input[:, :, 0:-2:4, 1:  :2]
+    return torch.stack(
+        (quadtree_leaf_0, quadtree_leaf_1, quadtree_leaf_2, quadtree_leaf_3),
+        dim = 4)#[batch * channels * width * (height - offset)//2 * 4]
+def pixel_even_row_dimond_unfold_1(input, d, stride=None, offset=0)->torch.Tensor:
+    """
+    将输入影像（双倍优化）每个池化核内元素展开为一行，
+    而且从生成的结果（六边形，带offset的影像）来看，
+    只展开了奇数行。
+    :param input: 输入的双倍优化存储影像
+    :param d: 池化核的直径大小
+    :param stride: 步长
+    :param offset:
+    :return: 展开的结果（奇数行，在h维步长为2*stride）
+    """
+    stride = stride
+    if stride == None:
+        stride = d
+    # stride = d#stride功能尚未推导好，先这样
+    # offset = (offset + d - 1)%2
+    height = int(np.ceil((input.shape[2] + 1 - 2*d + 1)/ (2*stride)))
+    width = int(np.ceil(int((input.shape[3] - 1)/2 + 1 - d) / stride))
+    for i in range(2*d-1):
+        t = np.abs(1 + i - d)
+        for k in range(d-t):
+            tmp = input[:, :,
+            i:i + 2 * stride * (height - 1)+1:(2 * stride),
+            1 + t + 2 * k:(1 + t + 2 * k) + (width - 1) * (2 * stride) + 1:2 * stride]
+            if i == 0 and k == 0:
+                unfold_img = torch.unsqueeze(tmp, 4)
+            else:
+                unfold_img = torch.cat(
+                (unfold_img, torch.unsqueeze(tmp, 4)),
+                dim=4)
+    return unfold_img
+def pixel_even_row_dimond_unfold(input, d, stride=None, offset=0)->torch.Tensor:
+    """
+    将输入影像（双倍优化）每个池化核内元素展开为一行，
+    而且从生成的结果（六边形，带offset的影像）来看，
+    只展开了奇数行。
+    :param input: 输入的双倍优化存储影像
+    :param d: 池化核的直径大小
+    :param stride: 步长
+    :param offset:
+    :return: 展开的结果（奇数行，在h维步长为2*stride）
+    """
+    stride = stride
+    if stride == None:
+        stride = d
+    # stride = d#stride功能尚未推导好，先这样
+    # offset = (offset + d - 1)%2
+    height = int(np.ceil((input.shape[2] - d + 1)/ (2*stride)))
+    width = int(np.ceil(
+        int(
+        (input.shape[3] - 1)/2# w0
+        -int((d-1)/2)
+        + (offset+d)%2
+        + 1 - d
+        ) / stride))
+    for i in range(d):
+        for k in range(d):
+            tmp = input[:, :,
+            i : i+2*stride*(height-1)+1 : 2*stride,
+            1+i+2*k : (1+i+2*k)+(width-1)*2*stride+1 : 2*stride]
+            if i == 0 and k == 0:
+                unfold_img = torch.unsqueeze(tmp, 4)
+            else:
+                unfold_img = torch.cat(
+                (unfold_img, torch.unsqueeze(tmp, 4)),
+                dim=4)
+    return unfold_img
+def pixel_even_row_square_unfold(input, d, stride=None)->torch.Tensor:
+    """
+    输入为正常的方格像素影像
+    :param input:
+    :param d:
+    :param stride:
+    :return:
+    """
+
+    stride = stride
+    if stride == None:
+        stride = d
+    if d % 2 != 0 or stride % 2 != 0:
+        raise Exception('降采样的因子 d 以及步长 stride 必须是偶数')
+    height = int(np.ceil((input.size(2)-d+1)/(2*stride)))
+    width = int(np.ceil(input.size(3) - d + 1)/stride)
+    for i in range(d):
+        for j in range(d):
+            tmp = input[:,:,
+                  i:i+2*stride*(height-1)+1:2*stride,
+                  j:j+stride*(width-1)+1:stride]
+            if i == 0 and j == 0:
+                unfold_img = torch.unsqueeze(tmp, 4)
+            else:
+                unfold_img = torch.cat(
+                    (unfold_img, torch.unsqueeze(tmp, 4)),
+                    dim=4)
+    return unfold_img
