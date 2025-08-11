@@ -1,3 +1,5 @@
 # HyGrid
 Hexagonal&amp;Rectangular Image Processing
-experimental CNN code will be available after publication
+
+# Update statement
+experimental CNN architecture code will be available after publication
